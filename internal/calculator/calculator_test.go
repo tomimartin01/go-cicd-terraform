@@ -12,7 +12,7 @@ func Test_Add(t *testing.T) {
 		expected int
 	}{
 		{
-			name:     "positive numbers",
+			name:     "Ok",
 			a:        2,
 			b:        3,
 			expected: 5,

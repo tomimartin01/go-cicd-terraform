@@ -14,6 +14,9 @@ const (
 )
 
 func InitEnv() error {
+	if os.Getenv("APP_ENV") != EnvLocal {
+		return nil
+	}
 	return godotenv.Load("local.env")
 }
 
