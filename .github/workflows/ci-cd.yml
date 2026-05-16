@@ -1,0 +1,266 @@
+# -----------------------------------------------------------------------------
+# CI/CD Pipeline — Express + Docker + ECS
+# -----------------------------------------------------------------------------
+# Aplica las buenas prácticas vistas en el módulo 11 (DevOps y CI/CD):
+#   · 11.14 GH Actions fundamentos → concurrency, permisos mínimos, pinning
+#   · 11.15 GH Actions con AWS     → OIDC, environments, actions oficiales AWS
+#   · 11.16 Tests avanzados        → SCA + secret scan + container scan
+#   · 11.8  Blue/Green             → ECS Native Blue/Green (sin CodeDeploy)
+#   · 11.10 Rollbacks              → ECS Circuit Breaker + smoke test + alarms
+#
+# Deploy: ECS Native. Desde julio 2025 el propio servicio ECS soporta
+# blue/green y rolling nativamente — es la opción recomendada por AWS para la
+# mayoría de workloads (ver 11.11 §11). La estrategia se configura en el
+# servicio ECS (`deploymentConfiguration.strategy`, `bakeTimeInMinutes`,
+# `deploymentCircuitBreaker`, alarmas), no en este workflow. El workflow solo
+# registra la nueva task definition y la aplica al servicio.
+#
+# Variables requeridas en el repo (Settings → Secrets and variables):
+#   vars.AWS_REGION            ej: eu-west-1
+#   vars.AWS_ACCOUNT_ID        ej: 123456789012
+#   vars.IAM_ROLE_TO_ASSUME    arn:aws:iam::<acc>:role/GitHubActionsRole
+#   vars.ECR_REPOSITORY        mi-app-express
+#   vars.ECS_CLUSTER           nombre del cluster
+#   vars.ECS_SERVICE           nombre del servicio ECS
+#   vars.CONTAINER_NAME        "app"
+#
+# Nota de seguridad (11.14, §7): en producción, fija las actions por SHA de
+# commit en lugar de por tag (ej. actions/checkout@<sha>). Aquí se usan tags
+# por legibilidad en el ejemplo del curso.
+# -----------------------------------------------------------------------------
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancela ejecuciones en curso del mismo ref cuando llega una nueva.
+# Evita builds obsoletos y ahorra minutos.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permisos mínimos a nivel workflow; los jobs que necesiten más los piden.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 2. Tests unitarios (paralelo al análisis estático).
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests with coverage
+        run: go test -v -coverprofile=coverage.out ./...
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3. Build de la imagen + scan + push a ECR.
+  # Solo se ejecuta tras pasar análisis + tests, y únicamente en push a main.
+  # Emite como artefactos los taskdef + appspec para el stage de deploy —
+  # garantizando que el artefacto desplegado es el mismo que pasó los tests.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build, scan & push image
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write       # OIDC → AWS (11.15, §3)
+    outputs:
+      image-uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # - name: Configure AWS credentials (OIDC)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ vars.IAM_ROLE_TO_ASSUME }}
+      #     aws-region: ${{ vars.AWS_REGION }}
+
+      # - name: Login to Amazon ECR
+      #   id: ecr-login
+      #   uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
+        id: image
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "uri=go-cicd-terra:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build local (no push todavía) para escanear antes de publicar.
+      - name: Build image (for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.image.outputs.uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      # Push solo si ha pasado el scan — artefacto inmutable.
+      # - name: Push image to ECR
+      #   run: docker push ${{ steps.image.outputs.uri }}
+
+      # Sustituye los placeholders que amazon-ecs-render-task-definition NO
+      # toca (solo reemplaza <IMAGE_URI> automáticamente). <AWS_ACCOUNT_ID> y
+      # <AWS_REGION> salen de las vars del repo.
+      # - name: Substitute taskdef placeholders
+      #   run: |
+      #     sed -i \
+      #       -e "s|<AWS_ACCOUNT_ID>|${{ vars.AWS_ACCOUNT_ID }}|g" \
+      #       -e "s|<AWS_REGION>|${{ vars.AWS_REGION }}|g" \
+      #       taskdef.json
+
+      # Render task definition con la imagen recién subida.
+      # La action escribe el JSON renderizado en un archivo de nombre aleatorio
+      # en /tmp/ (ej. /tmp/task-definition-abc123.json). Lo copiamos a un nombre
+      # estable para que el job de deploy pueda referenciarlo.
+      # - name: Render ECS task definition
+      #   id: render-taskdef
+      #   uses: aws-actions/amazon-ecs-render-task-definition@v1
+      #   with:
+      #     task-definition: taskdef.json
+      #     container-name: ${{ vars.CONTAINER_NAME }}
+      #     image: ${{ steps.image.outputs.uri }}
+
+      # - name: Normalize task definition path
+      #   run: cp "${{ steps.render-taskdef.outputs.task-definition }}" task-definition.json
+
+      # - name: Upload deploy artifacts
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: deploy-manifests
+      #     path: task-definition.json
+      #     retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. Deploy a staging — ECS Native (la estrategia blue/green o rolling la
+  # configura el propio servicio ECS, no este workflow).
+  # ---------------------------------------------------------------------------
+  # deploy-staging:
+  #   name: Deploy to staging
+  #   needs: build-and-push
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 30
+  #   environment:
+  #     name: staging
+  #     url: https://staging.example.com
+  #   permissions:
+  #     contents: read
+  #     id-token: write
+  #   steps:
+  #     - name: Download deploy manifests
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: deploy-manifests
+
+  #     - name: Configure AWS credentials (OIDC)
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: ${{ vars.IAM_ROLE_TO_ASSUME }}
+  #         aws-region: ${{ vars.AWS_REGION }}
+
+      # ECS Native deploy: registra la task definition y actualiza el servicio.
+      # Si el servicio está configurado con BLUE_GREEN → ECS hace bake period +
+      # traffic shift automáticamente; con ROLLING → rolling update.
+      # El rollback es automático si salta el Circuit Breaker o una alarma
+      # asociada al deployment (11.10).
+      # - name: Deploy to ECS
+      #   uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      #   with:
+      #     task-definition: task-definition.json
+      #     service: ${{ vars.ECS_SERVICE }}
+      #     cluster: ${{ vars.ECS_CLUSTER }}
+      #     wait-for-service-stability: true
+
+      # # Smoke test post-deploy (11.16, §7). Si falla → job falla, no avanza a prod.
+      # - name: Smoke test
+      #   run: |
+      #     for i in {1..10}; do
+      #       if curl --fail --silent https://staging.example.com/health; then
+      #         echo "Smoke test OK"
+      #         exit 0
+      #       fi
+      #       sleep 5
+      #     done
+      #     echo "Smoke test failed after 10 attempts"
+      #     exit 1
+
+  # ---------------------------------------------------------------------------
+  # 5. Deploy a producción — gate con aprobación manual vía GitHub Environment.
+  # ---------------------------------------------------------------------------
+  # deploy-prod:
+  #   name: Deploy to production
+  #   needs: deploy-staging
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 30
+  #   environment:
+  #     name: production       # configura required reviewers en el repo
+  #     url: https://api.example.com
+  #   permissions:
+  #     contents: read
+  #     id-token: write
+  #   steps:
+  #     - name: Download deploy manifests
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: deploy-manifests
+
+  #     - name: Configure AWS credentials (OIDC)
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: ${{ vars.IAM_ROLE_TO_ASSUME }}
+  #         aws-region: ${{ vars.AWS_REGION }}
+
+  #     - name: Deploy to ECS
+  #       uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+  #       with:
+  #         task-definition: task-definition.json
+  #         service: ${{ vars.ECS_SERVICE }}
+  #         cluster: ${{ vars.ECS_CLUSTER }}
+  #         wait-for-service-stability: true
+
+  #     - name: Smoke test
+  #       run: |
+  #         for i in {1..10}; do
+  #           if curl --fail --silent https://api.example.com/health; then
+  #             echo "Smoke test OK"
+  #             exit 0
+  #           fi
+  #           sleep 5
+  #         done
+  #         echo "Smoke test failed after 10 attempts"
+  #         exit 1
