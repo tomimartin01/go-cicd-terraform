@@ -1,0 +1,3 @@
+github.com/tomimartin01/go-cicd-terra/cmd
+github.com/tomimartin01/go-cicd-terra/internal/config
+github.com/tomimartin01/go-cicd-terra/internal/app
