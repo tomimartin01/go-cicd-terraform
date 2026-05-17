@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+local.env
+
+# Go build artifacts
+bin/
+*.test
+*.out
+coverage.out
+
+# Terraform local/state artifacts
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfvars
+*.tfvars.json
+*.tfplan
+
+# Keep lock file versioned
+!**/.terraform.lock.hcl

@@ -17,12 +17,16 @@
 #
 # Variables requeridas en el repo (Settings → Secrets and variables):
 #   vars.AWS_REGION            ej: eu-west-1
-#   vars.AWS_ACCOUNT_ID        ej: 123456789012
-#   vars.IAM_ROLE_TO_ASSUME    arn:aws:iam::<acc>:role/GitHubActionsRole
+#   vars.AWS_ACCOUNT_ID        opcional (solo si usas placeholders en taskdef)
 #   vars.ECR_REPOSITORY        mi-app-express
 #   vars.ECS_CLUSTER           nombre del cluster
 #   vars.ECS_SERVICE           nombre del servicio ECS
 #   vars.CONTAINER_NAME        "app"
+#
+# Secrets requeridos (lab con credenciales temporales):
+#   secrets.AWS_ACCESS_KEY_ID
+#   secrets.AWS_SECRET_ACCESS_KEY
+#   secrets.AWS_SESSION_TOKEN
 #
 # Nota de seguridad (11.14, §7): en producción, fija las actions por SHA de
 # commit en lugar de por tag (ej. actions/checkout@<sha>). Aquí se usan tags
@@ -84,7 +88,7 @@ jobs:
   # Emite como artefactos los taskdef + appspec para el stage de deploy —
   # garantizando que el artefacto desplegado es el mismo que pasó los tests.
   # ---------------------------------------------------------------------------
-  build:
+  build-and-push:
     name: Build, scan & push image
     needs: [test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -92,28 +96,29 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write       # OIDC → AWS (11.15, §3)
     outputs:
       image-uri: ${{ steps.image.outputs.uri }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # - name: Configure AWS credentials (OIDC)
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: ${{ vars.IAM_ROLE_TO_ASSUME }}
-      #     aws-region: ${{ vars.AWS_REGION }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # - name: Login to Amazon ECR
-      #   id: ecr-login
-      #   uses: aws-actions/amazon-ecr-login@v2
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set image URI
         id: image
         run: |
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          echo "uri=go-cicd-terra:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "uri=${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -130,9 +135,16 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      # Push solo si ha pasado el scan — artefacto inmutable.
-      # - name: Push image to ECR
-      #   run: docker push ${{ steps.image.outputs.uri }}
+      # Push only after the previous build/scan stages pass.
+      - name: Build and push image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
 
       # Sustituye los placeholders que amazon-ecs-render-task-definition NO
       # toca (solo reemplaza <IMAGE_URI> automáticamente). <AWS_ACCOUNT_ID> y

@@ -22,6 +22,7 @@ A Go application demonstrating CI/CD best practices with structured logging, gra
 │   └── config/              # Configuration and logger setup
 ├── go.mod
 ├── go.sum
+├── terraform/              # Infra as code (AWS)
 ├── .covignore              # Coverage ignore patterns
 └── README.md
 ```
@@ -68,6 +69,62 @@ go test -v ./internal/calculator
 go test -cover -coverprofile=coverage.out ./internal/calculator
 view coverage.out
 ```
+
+## Terraform (Infra)
+
+This repository includes Terraform configuration in `terraform/` to provision AWS resources for the migration to ECS.
+
+Current Terraform scope includes:
+
+- **ECR Repository** for container images
+- **ECR Lifecycle Policy** to expire old images automatically
+- **ECS Cluster** for running services/tasks
+- **CloudWatch Log Group** for ECS logs
+- Existing Lambda/API Gateway resources (still present during migration)
+
+### Terraform Prerequisites
+
+- Terraform `>= 1.5`
+- AWS credentials configured locally (for example with profile `dev-profile`)
+- S3 backend bucket already created (as configured in `terraform/providers.tf`)
+
+### Terraform Commands
+
+```bash
+cd terraform
+
+# Format files
+terraform fmt
+
+# Initialize backend/providers
+terraform init
+
+# Validate configuration
+terraform validate
+
+# Preview changes
+terraform plan
+
+# Apply changes
+terraform apply
+
+# Show outputs (for example API endpoint / ECR URL)
+terraform output
+
+# Destroy resources (careful)
+terraform destroy
+```
+
+### Optional: one-command local deploy script
+
+You can also use:
+
+```bash
+cd terraform
+./deploy.sh
+```
+
+The script compiles the Go binary for Lambda and then runs Terraform apply.
 
 ## Environment Variables
 
