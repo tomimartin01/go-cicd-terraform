@@ -102,6 +102,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Student AWS accounts usually cannot configure GitHub OIDC trust relationships.
+      # For this reason, AWS credentials are provided via GitHub Actions secrets.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -146,77 +148,70 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      # Sustituye los placeholders que amazon-ecs-render-task-definition NO
-      # toca (solo reemplaza <IMAGE_URI> automáticamente). <AWS_ACCOUNT_ID> y
-      # <AWS_REGION> salen de las vars del repo.
-      # - name: Substitute taskdef placeholders
-      #   run: |
-      #     sed -i \
-      #       -e "s|<AWS_ACCOUNT_ID>|${{ vars.AWS_ACCOUNT_ID }}|g" \
-      #       -e "s|<AWS_REGION>|${{ vars.AWS_REGION }}|g" \
-      #       taskdef.json
+      # Substitute placeholders not handled by amazon-ecs-render-task-definition.
+      - name: Substitute taskdef placeholders
+        run: |
+          sed -i \
+            -e "s|<AWS_ACCOUNT_ID>|${{ vars.AWS_ACCOUNT_ID }}|g" \
+            -e "s|<AWS_REGION>|${{ vars.AWS_REGION }}|g" \
+            taskdef.json
 
-      # Render task definition con la imagen recién subida.
-      # La action escribe el JSON renderizado en un archivo de nombre aleatorio
-      # en /tmp/ (ej. /tmp/task-definition-abc123.json). Lo copiamos a un nombre
-      # estable para que el job de deploy pueda referenciarlo.
-      # - name: Render ECS task definition
-      #   id: render-taskdef
-      #   uses: aws-actions/amazon-ecs-render-task-definition@v1
-      #   with:
-      #     task-definition: taskdef.json
-      #     container-name: ${{ vars.CONTAINER_NAME }}
-      #     image: ${{ steps.image.outputs.uri }}
+      # Render task definition with the newly pushed image.
+      - name: Render ECS task definition
+        id: render-taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: taskdef.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.uri }}
 
-      # - name: Normalize task definition path
-      #   run: cp "${{ steps.render-taskdef.outputs.task-definition }}" task-definition.json
+      - name: Normalize task definition path
+        run: cp "${{ steps.render-taskdef.outputs.task-definition }}" task-definition.json
 
-      # - name: Upload deploy artifacts
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: deploy-manifests
-      #     path: task-definition.json
-      #     retention-days: 30
+      - name: Upload deploy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-manifests
+          path: task-definition.json
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 4. Deploy a staging — ECS Native (la estrategia blue/green o rolling la
-  # configura el propio servicio ECS, no este workflow).
+  # 4. Single deploy stage (staging) — ECS Native.
   # ---------------------------------------------------------------------------
-  # deploy-staging:
-  #   name: Deploy to staging
-  #   needs: build-and-push
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 30
-  #   environment:
-  #     name: staging
-  #     url: https://staging.example.com
-  #   permissions:
-  #     contents: read
-  #     id-token: write
-  #   steps:
-  #     - name: Download deploy manifests
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: deploy-manifests
+  deploy-staging:
+    name: Deploy to staging
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: https://staging.example.com
+    permissions:
+      contents: read
+    steps:
+      - name: Download deploy manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-manifests
 
-  #     - name: Configure AWS credentials (OIDC)
-  #       uses: aws-actions/configure-aws-credentials@v4
-  #       with:
-  #         role-to-assume: ${{ vars.IAM_ROLE_TO_ASSUME }}
-  #         aws-region: ${{ vars.AWS_REGION }}
+      # Student AWS accounts usually cannot configure GitHub OIDC trust relationships.
+      # For this reason, AWS credentials are provided via GitHub Actions secrets.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # ECS Native deploy: registra la task definition y actualiza el servicio.
-      # Si el servicio está configurado con BLUE_GREEN → ECS hace bake period +
-      # traffic shift automáticamente; con ROLLING → rolling update.
-      # El rollback es automático si salta el Circuit Breaker o una alarma
-      # asociada al deployment (11.10).
-      # - name: Deploy to ECS
-      #   uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-      #   with:
-      #     task-definition: task-definition.json
-      #     service: ${{ vars.ECS_SERVICE }}
-      #     cluster: ${{ vars.ECS_CLUSTER }}
-      #     wait-for-service-stability: true
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: task-definition.json
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
 
       # # Smoke test post-deploy (11.16, §7). Si falla → job falla, no avanza a prod.
       # - name: Smoke test
