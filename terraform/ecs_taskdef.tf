@@ -1,4 +1,4 @@
-// Basic ECS Task Definition for MVP
+// ECS Task Definition 
 // Uses the ECR image, exposes port 80, no advanced variables or volumes.
 
 resource "aws_ecs_task_definition" "app" {
